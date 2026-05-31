@@ -674,16 +674,39 @@ Status PartitionedSpillerWriter::_compact_skew_chunks(size_t num_rows, std::vect
     if (num_rows < 30) {
         return Status::OK();
     }
-    // sample 30 row idx
+    // Defense-in-depth: when a partition flush races with cancellation (e.g. RG memory
+    // limiter), the (num_rows, chunks) invariant has been observed to break in
+    // production, causing the sampling loop to walk curr_chunk_idx past chunks.size()
+    // and OOB-read the vector backing buffer. Re-derive the effective row count from
+    // the chunks themselves and bail cleanly if it would be unsafe to sample. Skew
+    // elimination is an optimization, not a correctness path.
+    size_t effective_rows = 0;
+    for (const auto& c : chunks) {
+        if (c != nullptr && !c->is_empty()) {
+            effective_rows += c->num_rows();
+        }
+    }
+    if (effective_rows < 30) {
+        return Status::OK();
+    }
+    // sample 30 row idx, drawn from the actual row sum so samples never index past
+    // the data
     std::random_device rd;
     std::mt19937_64 gen(rd());
-    std::uniform_int_distribution<size_t> distrib(0, num_rows - 1);
+    std::uniform_int_distribution<size_t> distrib(0, effective_rows - 1);
     std::vector<size_t> samples(30);
     for (auto i = 0; i < samples.size(); ++i) {
         samples[i] = distrib(gen);
     }
     std::sort(samples.begin(), samples.end());
+    // Skip leading null/empty chunks before anchoring curr_num_rows.
+    // effective_rows >= 30 guarantees at least one non-empty chunk exists.
     size_t curr_chunk_idx = 0;
+    while (curr_chunk_idx < chunks.size() &&
+           (chunks[curr_chunk_idx] == nullptr || chunks[curr_chunk_idx]->is_empty())) {
+        ++curr_chunk_idx;
+    }
+    DCHECK_LT(curr_chunk_idx, chunks.size());
     size_t curr_num_rows = chunks[curr_chunk_idx]->num_rows();
     phmap::flat_hash_map<uint32_t, size_t, StdHashWithSeed<uint32_t, PhmapSeed2>> hash_value_counts;
 
@@ -691,6 +714,12 @@ Status PartitionedSpillerWriter::_compact_skew_chunks(size_t num_rows, std::vect
     for (auto idx : samples) {
         while (idx >= curr_num_rows) {
             ++curr_chunk_idx;
+            if (curr_chunk_idx >= chunks.size()) {
+                // Unreachable in normal flow because samples are bounded by
+                // effective_rows; bail defensively in case the invariant has
+                // been broken concurrently.
+                return Status::OK();
+            }
             if (chunks[curr_chunk_idx] == nullptr || chunks[curr_chunk_idx]->is_empty()) {
                 continue;
             }
@@ -722,7 +751,9 @@ Status PartitionedSpillerWriter::_compact_skew_chunks(size_t num_rows, std::vect
                                          [](const auto& lhs, const auto& rhs) { return lhs.second < rhs.second; });
 
     // if the most-repetitive hash value's frequency is greater than 25%, then we consider it as skewed data.
-    if (mode_elem_it->second < num_rows * 0.25) {
+    // Use effective_rows (the actual row count derived from chunks above) rather than the
+    // caller-supplied num_rows, which can be stale or inflated under cancellation.
+    if (mode_elem_it->second < effective_rows * 0.25) {
         return Status::OK();
     }
 
