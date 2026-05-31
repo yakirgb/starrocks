@@ -44,6 +44,7 @@
 #include "common/statusor.h"
 #include "compute_env/sorting/merge.h"
 #include "compute_env/sorting/sorting.h"
+#include "exec/aggregator.h"
 #include "exec/spill/executor.h"
 #include "exec/spill/log_block_manager.h"
 #include "exec/spill/mem_table.h"
@@ -739,6 +740,91 @@ TEST_F(SpillTest, aligned_buffer) {
     buffer.resize(1);
     ASSERT_EQ(buffer.data()[0], '@');
     ASSERT_TRUE(is_aligned(buffer.data(), 4096));
+}
+
+// Regression for SIGSEGV in PartitionedSpillerWriter::_compact_skew_chunks.
+// Production crash signature: page-aligned high-heap fault, PC inside the skew-sampling
+// loop. Root cause: when num_rows passed in does not match sum(chunks[i]->num_rows()),
+// the while-loop walks curr_chunk_idx past chunks.size() and OOB-reads the backing
+// vector. Drive _compact_skew_chunks with malformed inputs; under ASAN the unfixed code
+// trips, while the fixed code returns Status::OK() and silently skips skew elimination.
+TEST_F(SpillTest, compact_skew_chunks_size_mismatch_no_crash) {
+    ObjectPool pool;
+    std::vector<bool> nullables = {false};
+    TExprBuilder tuple_slots_builder;
+    tuple_slots_builder << TYPE_INT;
+    auto tuple_slots = tuple_slots_builder.get_res();
+
+    auto ctx_st = no_partition_context(&pool, &dummy_rt_st, {}, tuple_slots);
+    ASSERT_OK(ctx_st.status());
+    (void)ctx_st.value();
+
+    std::vector<ExprContext*> tuple;
+    ASSERT_OK(ExprFactory::create_expr_trees(&pool, tuple_slots, &tuple, &dummy_rt_st));
+
+    RandomChunkBuilder chunk_builder;
+    auto factory = spill::make_spilled_factory();
+
+    SpilledOptions spill_options(1);
+    spill_options.mem_table_pool_size = 1;
+    spill_options.spill_mem_table_bytes_size = 1 * 1024 * 1024;
+    spill_options.spill_type = spill::SpillFormaterType::SPILL_BY_COLUMN;
+    spill_options.block_manager = dummy_block_mgr.get();
+
+    auto spiller = factory->create(spill_options);
+    spiller->set_metrics(metrics);
+    ASSERT_OK(spiller->prepare(&dummy_rt_st));
+
+    auto* writer = down_cast<spill::PartitionedSpillerWriter*>(spiller->_writer.get());
+    ASSERT_NE(writer, nullptr);
+
+    AggregatorParamsPtr agg_params = std::make_shared<AggregatorParams>();
+
+    // Build a chunk shaped like a real spill input: data column(s) plus a trailing
+    // hash column. Distinct hash values per row keep us below the 25% skew threshold
+    // so the function exercises only the sampling/counting paths (the bug location)
+    // and does not enter the merge branch, which would need a full Aggregator setup.
+    auto build_chunk_with_distinct_hashes = [&]() {
+        auto chunk = chunk_builder.gen(tuple, nullables);
+        auto hash_column = spill::SpillHashColumn::create(chunk->num_rows());
+        auto& data = down_cast<spill::SpillHashColumn*>(hash_column.get())->get_data();
+        for (size_t i = 0; i < data.size(); ++i) {
+            data[i] = static_cast<uint32_t>(i);
+        }
+        chunk->append_column(std::move(hash_column), Chunk::HASH_AGG_SPILL_HASH_SLOT_ID);
+        return chunk;
+    };
+
+    // Case 1: claimed num_rows > sum(chunks[i]->num_rows()). The unfixed code walks
+    // curr_chunk_idx past chunks.size() and OOB-reads the vector backing buffer —
+    // this is the production crash signature.
+    {
+        auto chunk = build_chunk_with_distinct_hashes();
+        std::vector<ChunkPtr> chunks{chunk};
+        size_t inflated_num_rows = chunk->num_rows() * 200;  // >> actual rows
+        auto st = writer->_compact_skew_chunks(inflated_num_rows, chunks, agg_params);
+        ASSERT_TRUE(st.ok()) << st.to_string();
+    }
+
+    // Case 2: empty chunks vector with num_rows >= 30. The unfixed code dereferences
+    // chunks[0] on an empty vector before the loop even starts.
+    {
+        std::vector<ChunkPtr> empty_chunks;
+        auto st = writer->_compact_skew_chunks(30, empty_chunks, agg_params);
+        ASSERT_TRUE(st.ok()) << st.to_string();
+    }
+
+    // Case 3: a null trailing chunk inside a chunks vector that is otherwise consistent
+    // with num_rows. Asserts the loop tolerates null entries without walking past size.
+    {
+        auto chunk = build_chunk_with_distinct_hashes();
+        std::vector<ChunkPtr> chunks{chunk, nullptr};
+        // Claim more rows than the single non-null chunk holds: forces the loop to
+        // advance into the null entry and (in the unfixed code) past it.
+        size_t inflated_num_rows = chunk->num_rows() * 50;
+        auto st = writer->_compact_skew_chunks(inflated_num_rows, chunks, agg_params);
+        ASSERT_TRUE(st.ok()) << st.to_string();
+    }
 }
 
 /*
